@@ -1,7 +1,12 @@
-'use strict';
+import { verify, sign, JwtPayload } from 'jsonwebtoken';
+import { isIP } from 'net';
+import type { OutgoingHttpHeaders, Agent } from 'http';
 
-const jwt = require('jsonwebtoken');
-const isIp = require('is-ip');
+import { debug } from 'debug';
+import { timingSafeEqual, createHmac, randomBytes } from 'crypto';
+import { Request } from './request';
+
+const logger = debug('node-bigcommerce:bigcommerce');
 
 /**
  * BigCommerce OAuth2 Authentication and API access
@@ -22,25 +27,46 @@ const isIp = require('is-ip');
  * }
  */
 
-const logger = require('debug')('node-bigcommerce:bigcommerce'),
-  crypto = require('crypto'),
-  Request = require('./request');
+export interface Config {
+  agent?: boolean | Agent;
+  apiUrl?: string;
+  logLevel?: 'info' | 'debug';
+  clientId: string;
+  secret: string;
+  callback?: string;
+  accessToken: string;
+  storeHash: string;
+  responseType?: 'json' | 'xml';
+  headers?: OutgoingHttpHeaders;
+  apiVersion?: 'v2' | 'v3';
+  loginUrl?: string;
+  failOnLimitReached?: boolean;
+}
 
-class BigCommerce {
-  constructor(config) {
+export interface SignJWTOptions {
+  redirectUrl?: string;
+  requestIP?: string;
+  useBCTime?: boolean;
+}
+
+export default class BigCommerce {
+  config: Config;
+  apiVersion: 'v2' | 'v3' = 'v2';
+  constructor(config: Config) {
     if (!config) {
       throw new Error(
         'Config missing. The config object is required to make any call to the ' +
-        'BigCommerce API'
+          'BigCommerce API'
       );
     }
-
+    if (config.apiVersion) {
+      this.apiVersion = config.apiVersion;
+    }
     this.config = config;
-    this.apiVersion = this.config.apiVersion || 'v2';
   }
 
   /** Verify legacy signed_payload (can be ignored in favor of JWT) **/
-  verify(signedRequest) {
+  verify(signedRequest: string) {
     if (!signedRequest) {
       throw new Error('The signed request is required to verify the call.');
     }
@@ -49,7 +75,7 @@ class BigCommerce {
     if (splitRequest.length < 2) {
       throw new Error(
         'The signed request will come in two parts seperated by a .(full stop). ' +
-        'this signed request contains less than 2 parts.'
+          'this signed request contains less than 2 parts.'
       );
     }
 
@@ -60,7 +86,7 @@ class BigCommerce {
     logger('JSON: ' + json);
     logger('Signature: ' + signature);
 
-    const expected = crypto.createHmac('sha256', this.config.secret)
+    const expected = createHmac('sha256', this.config.secret)
       .update(json)
       .digest('hex');
 
@@ -68,7 +94,10 @@ class BigCommerce {
 
     if (
       expected.length !== signature.length ||
-      !crypto.timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(signature, 'utf8'))
+      !timingSafeEqual(
+        Buffer.from(expected, 'utf8'),
+        Buffer.from(signature, 'utf8')
+      )
     ) {
       throw new Error('Signature is invalid');
     }
@@ -81,10 +110,10 @@ class BigCommerce {
    * @param signedRequestJwt
    * @returns object
    */
-  verifyJWT(signedRequestJwt) {
-    return jwt.verify(signedRequestJwt, this.config.secret, {
+  verifyJWT(signedRequestJwt: string): string | JwtPayload {
+    return verify(signedRequestJwt, this.config.secret, {
       algorithms: ['HS256'],
-      audience: this.config.client_id
+      audience: this.config.clientId
     });
   }
 
@@ -97,15 +126,23 @@ class BigCommerce {
    * @param url
    * @returns string
    */
-  constructJWTFromAuthData(user, context, url) {
-    return jwt.sign({
-      aud: this.config.client_id,
-      iss: this.config.client_id,
-      sub: context,
-      user,
-      owner: user,
-      url: url || '/'
-    }, this.config.secret, { expiresIn: '24h', algorithm: 'HS256' });
+  constructJWTFromAuthData(
+    user: { id: number, email: string },
+    context: string,
+    url: string
+  ) {
+    return sign(
+      {
+        aud: this.config.clientId,
+        iss: this.config.clientId,
+        sub: context,
+        user,
+        owner: user,
+        url: url || '/'
+      },
+      this.config.secret,
+      { expiresIn: '24h', algorithm: 'HS256' }
+    );
   }
 
   /** Construct a JWT for customer login https://developer.bigcommerce.com/api-docs/storefront/customer-login-api
@@ -114,14 +151,19 @@ class BigCommerce {
    * @param options
    * @returns string
    */
-  createCustomerLoginJWT(customerId, channelId = 1, options = {}) {
-    const payload = {
+  async createCustomerLoginJWT(
+    customerId: number,
+    channelId = 1,
+    options: SignJWTOptions = {}
+  ): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const payload: any = {
       iss: this.config.clientId,
       operation: 'customer_login',
       store_hash: this.config.storeHash,
       customer_id: customerId,
       channel_id: channelId,
-      jti: crypto.randomBytes(32).toString('hex')
+      jti: randomBytes(32).toString('hex')
     };
 
     /* Optional redirect URL (relative path on the storefront), e.g. '/shop-all/' */
@@ -130,11 +172,11 @@ class BigCommerce {
     }
 
     /*
-    * Optional end-user IP for extra security
-    * The login will be rejected if it does not come from this IP
-    */
+     * Optional end-user IP for extra security
+     * The login will be rejected if it does not come from this IP
+     */
     if (options.requestIP) {
-      if (!isIp(options.requestIP)) {
+      if (isIP(options.requestIP) === 0) {
         throw new Error('Invalid IP address');
       }
       payload.request_ip = options.requestIP;
@@ -145,16 +187,19 @@ class BigCommerce {
      * This is useful to prevent clock skew resulting in invalid JWTs
      */
     if (options.useBCTime) {
-      payload.iat = this.getTime();
+      payload.iat = await this.getTime();
     } else {
       payload.iat = Math.floor(Date.now() / 1000);
     }
 
-    return jwt.sign(payload, this.config.secret, { expiresIn: '24h', algorithm: 'HS256' });
+    return sign(payload, this.config.secret, {
+      expiresIn: '24h',
+      algorithm: 'HS256'
+    });
   }
 
-  async authorize(query) {
-    if (!query) throw new Error('The URL query paramaters are required.');
+  authorize(query: { code: string, scope: string, context: string }) {
+    if (!query) throw new Error('The URL query parameters are required.');
 
     const payload = {
       client_id: this.config.clientId,
@@ -172,30 +217,37 @@ class BigCommerce {
       failOnLimitReached: this.config.failOnLimitReached
     });
 
-    return await request.run('post', '/oauth2/token', payload);
+    return request.run('post', '/oauth2/token', payload);
   }
 
   createAPIRequest() {
-    const accept = this.config.responseType === 'xml' ? 'application/xml' : 'application/json';
+    const accept =
+      this.config.responseType === 'xml'
+        ? 'application/xml'
+        : 'application/json';
 
     const apiUrl = this.config.apiUrl || 'api.bigcommerce.com';
 
     return new Request(apiUrl, {
-      headers: Object.assign({
-        Accept: accept,
-        'X-Auth-Client': this.config.clientId,
-        'X-Auth-Token': this.config.accessToken
-      }, this.config.headers || {}),
+      headers: Object.assign(
+        {
+          Accept: accept,
+          'X-Auth-Client': this.config.clientId,
+          'X-Auth-Token': this.config.accessToken
+        },
+        this.config.headers || {}
+      ),
       failOnLimitReached: this.config.failOnLimitReached,
       agent: this.config.agent
     });
   }
 
-  async request(type, path, data) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  request(method: string, path: string, data?: any): Promise<any> {
     if (!this.config.accessToken || !this.config.storeHash) {
       throw new Error(
         'Get request error: the access token and store hash are required to ' +
-        'call the BigCommerce API'
+          'call the BigCommerce API'
       );
     }
 
@@ -211,30 +263,32 @@ class BigCommerce {
       fullPath += path;
     }
 
-    return await request.run(type, fullPath, data);
+    return request.run(method.toUpperCase(), fullPath, data);
   }
 
-  getTime() {
+  getTime(): Promise<number> {
     const request = this.createAPIRequest();
 
-    return request.run('GET', `/stores/${this.config.storeHash}/v2/time`).time;
+    return request
+      .run('GET', `/stores/${this.config.storeHash}/v2/time`)
+      .then((resp: { time: number }) => resp.time);
   }
 
-  async get(path) {
-    return await this.request('get', path);
+  get(path: string) {
+    return this.request('GET', path);
   }
 
-  async post(path, data) {
-    return await this.request('post', path, data);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  post(path: string, data: any) {
+    return this.request('POST', path, data);
   }
 
-  async put(path, data) {
-    return await this.request('put', path, data);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  put(path: string, data: any) {
+    return this.request('PUT', path, data);
   }
 
-  async delete(path) {
-    return await this.request('delete', path);
+  delete(path: string) {
+    return this.request('DELETE', path);
   }
 }
-
-module.exports = BigCommerce;
