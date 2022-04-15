@@ -127,7 +127,7 @@ export default class BigCommerce {
    * @returns string
    */
   constructJWTFromAuthData(
-    user: { id: number, email: string },
+    user: { id: number; email: string },
     context: string,
     url: string
   ) {
@@ -198,7 +198,7 @@ export default class BigCommerce {
     });
   }
 
-  authorize(query: { code: string, scope: string, context: string }) {
+  authorize(query: { code: string; scope: string; context: string }) {
     if (!query) throw new Error('The URL query parameters are required.');
 
     const payload = {
