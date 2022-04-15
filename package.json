@@ -2,7 +2,7 @@
   "name": "node-bigcommerce",
   "version": "4.1.0",
   "description": "A node module for authentication and use with the BigCommerce API",
-  "main": "./lib/bigcommerce",
+  "main": "./dist/bigcommerce",
   "scripts": {
     "coverage": "jest --coverage",
     "lint": "eslint . --ext .ts",
